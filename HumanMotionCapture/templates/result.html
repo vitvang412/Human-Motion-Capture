@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Result - HMC</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <h1>Analysis Result</h1>
+    <div id="3d-viewer" style="width: 800px; height: 600px;"></div>
+    <script type="module" src="{{ url_for('static', filename='js/viewer.js') }}"></script>
+</body>
+</html>
