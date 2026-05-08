@@ -263,9 +263,7 @@
         .label-bend { color: var(--color-bend); }
         .label-unknown { color: var(--text-muted); }
 
-        .confidence-container { width: 100%; background: var(--bg-base); height: 6px; border-radius: 3px; overflow: hidden; margin-top: 0.8rem; }
-        #confidence-bar { height: 100%; background: var(--primary); width: 0%; transition: width 1s cubic-bezier(0.22, 1, 0.36, 1); }
-        #confidence-text { font-size: 0.9rem; color: var(--text-muted); margin-top: 0.5rem; display: block; }
+
         
         #pose-reason { 
             font-style: italic; 
@@ -352,10 +350,6 @@
             <div class="col">
                 <div>
                     <h2 id="pose-label">ĐỨNG THẲNG</h2>
-                    <div class="confidence-container">
-                        <div id="confidence-bar"></div>
-                    </div>
-                    <span id="confidence-text">Độ tự tin: 0%</span>
                 </div>
                 
                 <p id="pose-reason">Đang phân tích lý do...</p>
@@ -502,10 +496,7 @@
             else if (data.pose_label.includes('CÚI')) labelEl.classList.add('label-bend');
             else labelEl.classList.add('label-unknown');
 
-            setTimeout(() => {
-                document.getElementById('confidence-bar').style.width = `${data.confidence}%`;
-            }, 100);
-            document.getElementById('confidence-text').innerText = `Độ tự tin: ${data.confidence}%`;
+
             document.getElementById('pose-reason').innerText = data.reason;
 
             const tbody = document.getElementById('angles-body');
@@ -541,7 +532,6 @@
         function resetApp() {
             currentFile = null;
             fileInput.value = '';
-            document.getElementById('confidence-bar').style.width = '0%';
             
             uploadSection.style.display = 'flex';
             previewSection.style.display = 'none';

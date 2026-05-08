@@ -40,7 +40,7 @@ const BONE_ORDER = [
 
 function applyBones(poseData) {
     if (!poseData || !poseData.bones || !characterModel) {
-        console.warn('⚠️ applyBones: thiếu poseData hoặc model chưa load');
+        console.warn('applyBones: thiếu poseData hoặc model chưa load');
         return;
     }
 
@@ -65,7 +65,16 @@ function applyBones(poseData) {
         let found = boneMap[normalizedKey];
         if (!found) return;
 
-        // Tìm xương con trực tiếp để làm vector hướng (chọn child đầu tiên là bone)
+        // ── HEAD & NECK: giữ T-Pose, tránh cúi đầu sai ──
+        if (shortName === 'Head' || shortName === 'Neck') {
+            if (restQuaternions[found.name]) {
+                found.quaternion.copy(restQuaternions[found.name]);
+            }
+            appliedCount++;
+            return;
+        }
+
+        // Tìm child bone đầu tiên để làm vector hướng
         let childBone = null;
         for (let i = 0; i < found.children.length; i++) {
             if (found.children[i].type === 'Bone' || found.children[i].isBone) {
@@ -74,38 +83,90 @@ function applyBones(poseData) {
             }
         }
 
-        if (childBone) {
-            // Cập nhật ma trận vì các parent đã bị xoay
-            characterModel.updateMatrixWorld(true);
+        if (!childBone) return;
 
-            let posParent = new THREE.Vector3();
-            found.getWorldPosition(posParent);
+        // Cập nhật world matrix sau khi các parent đã xoay
+        characterModel.updateMatrixWorld(true);
 
-            let posChild = new THREE.Vector3();
-            childBone.getWorldPosition(posChild);
+        // Vector hướng hiện tại của xương (world space)
+        let posParent = new THREE.Vector3();
+        let posChild  = new THREE.Vector3();
+        found.getWorldPosition(posParent);
+        childBone.getWorldPosition(posChild);
+        let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
 
-            let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
+        // Vector mục tiêu từ Python (world space, đã chuyển hệ tọa độ)
+        let v_target = new THREE.Vector3(
+            data.target_vec.x,
+            data.target_vec.y,
+            data.target_vec.z
+        ).normalize();
 
-            // Vector mục tiêu từ Python
-            let v_target = new THREE.Vector3(data.target_vec.x, data.target_vec.y, data.target_vec.z).normalize();
+        // Góc giữa vector hiện tại và mục tiêu (rad)
+        let dot = THREE.MathUtils.clamp(v_current.dot(v_target), -1, 1);
+        let angleDiff = Math.acos(dot);
 
-            // Tính quaternion quay từ v_current sang v_target
-            let q_world = new THREE.Quaternion().setFromUnitVectors(v_current, v_target);
-
-            // LocalQuat = ParentWorldQuat^-1 * (q_world * OldWorldQuat)
-            let oldWorldQuat = new THREE.Quaternion();
-            found.getWorldQuaternion(oldWorldQuat);
-
-            let newWorldQuat = q_world.multiply(oldWorldQuat);
-
-            let parentWorldQuat = new THREE.Quaternion();
-            if (found.parent) {
-                found.parent.getWorldQuaternion(parentWorldQuat);
-            }
-
-            found.quaternion.copy(parentWorldQuat.invert().multiply(newWorldQuat));
+        // Nếu góc lệch quá nhỏ thì bỏ qua
+        if (angleDiff < 0.01) {
             appliedCount++;
+            return;
         }
+
+        // ── GIỚI HẠN GÓC XOAY tối đa theo từng loại xương ──
+        // Thay vì clamp Euler (sai do hệ tọa độ local), ta clamp chính góc lệch
+        const MAX_ANGLE = {
+            'LeftArm':      Math.PI * 0.90,  // 162°
+            'RightArm':     Math.PI * 0.90,
+            'LeftForeArm':  Math.PI * 0.80,  // 144°
+            'RightForeArm': Math.PI * 0.80,
+            'LeftShoulder': Math.PI * 0.25,  // 45°
+            'RightShoulder':Math.PI * 0.25,
+            'Spine':        Math.PI * 0.30,
+            'Spine1':       Math.PI * 0.25,
+            'Spine2':       Math.PI * 0.25,
+            'LeftUpLeg':    Math.PI * 0.90,
+            'RightUpLeg':   Math.PI * 0.90,
+            'LeftLeg':      Math.PI * 0.85,
+            'RightLeg':     Math.PI * 0.85,
+        };
+
+        let maxAngle = MAX_ANGLE[shortName] || Math.PI;
+        // Nếu vượt quá giới hạn, lerp vector về gần hơn
+        let effectiveVec = v_target;
+        if (angleDiff > maxAngle) {
+            let t = maxAngle / angleDiff;
+            effectiveVec = v_current.clone().lerp(v_target, t).normalize();
+        }
+
+        // Tính quaternion world để xoay v_current → effectiveVec
+        let q_world = new THREE.Quaternion().setFromUnitVectors(v_current, effectiveVec);
+
+        // Lấy world quaternion hiện tại của xương (CLONE để tránh mutate)
+        let oldWorldQuat = new THREE.Quaternion();
+        found.getWorldQuaternion(oldWorldQuat);
+
+        // Áp dụng rotation world lên
+        let newWorldQuat = q_world.clone().multiply(oldWorldQuat);
+
+        // Chuyển về local space: localQuat = parent_world^-1 * new_world
+        let parentWorldQuat = new THREE.Quaternion();
+        if (found.parent) {
+            found.parent.getWorldQuaternion(parentWorldQuat);
+        }
+
+        let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+
+        // Slerp nhẹ từ T-Pose đến pose mới để tránh jump đột ngột
+        // (giảm clipping ở các tư thế cực đoan)
+        let SLERP_FACTOR = 0.85; // 85% tiến tới pose mục tiêu
+        let restQuat = restQuaternions[found.name];
+        if (restQuat) {
+            found.quaternion.slerpQuaternions(restQuat, localQuat, SLERP_FACTOR);
+        } else {
+            found.quaternion.copy(localQuat);
+        }
+
+        appliedCount++;
     });
 
     // 3. Cập nhật trạng thái hiển thị
@@ -113,13 +174,14 @@ function applyBones(poseData) {
     if (statusEl) {
         if (appliedCount > 0) {
             statusEl.innerHTML = 'Đã đồng bộ ' + appliedCount + ' khớp xương';
-            statusEl.style.color = '#739E82'; // Sage green
+            statusEl.style.color = '#739E82';
         } else {
             statusEl.innerHTML = 'Không thể đồng bộ khớp xương';
-            statusEl.style.color = '#C87979'; // Muted rose
+            statusEl.style.color = '#C87979';
         }
     }
 }
+
 
 // =============================================
 // KHỞI TẠO SCENE
@@ -213,12 +275,12 @@ function initViewer(containerId, poseData) {
                     if (child.isSkinnedMesh) {
                         child.frustumCulled = false;
                     }
-                    
+
                     // Khắc phục lỗi vật liệu (với một số mô hình bị trong suốt/lỗi Z-fighting)
                     if (child.isMesh && child.material) {
                         child.castShadow = true;
                         child.receiveShadow = true;
-                        
+
                         let mats = Array.isArray(child.material) ? child.material : [child.material];
                         mats.forEach(mat => {
                             // Ép buộc ghi depth để các bộ phận không bị đè ngược lên nhau
