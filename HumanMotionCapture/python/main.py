@@ -37,7 +37,7 @@ def run_full_pipeline(image_np):
         pose_classification = classify_pose(angles)
         
         # 4. Trích xuất Rotation của xương cho mô hình 3D (Three.js)
-        pose_3d = convert_to_3d(landmarks)
+        pose_3d = convert_to_3d(landmarks, pose_label=pose_classification.get("label", ""))
         
         # DEBUG: In giá trị xương ra terminal
         print("[DEBUG pose_3d bones]")

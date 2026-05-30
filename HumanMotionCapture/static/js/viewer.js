@@ -39,9 +39,22 @@ const BONE_ORDER = [
 ];
 
 function applyBones(poseData) {
-    if (!poseData || !poseData.bones || !characterModel) {
-        console.warn('applyBones: thiếu poseData hoặc model chưa load');
+    // poseData là full result object: { pose_3d: { bones: {...} }, angles: {...}, pose_label: '...' }
+    const bonesData = (poseData.pose_3d || poseData).bones;
+    if (!bonesData || !characterModel) {
+        console.warn('applyBones: thiếu bonesData hoặc model chưa load');
         return;
+    }
+
+    const angles = poseData.angles || {};
+    const poseLabel = poseData.pose_label || '';
+    const torsoLean = angles.torso_lean || 0;  // độ, 0 = đứng thẳng, ~170 = cúi sâu
+    const isBowing = poseLabel.includes('CÚI') || torsoLean > 80;
+    const isSquatting = poseLabel.includes('XỔM');
+
+    if (characterModel.userData && characterModel.userData.originalY !== undefined) {
+        // Hạ thấp nhân vật nếu đang ngồi xổm
+        characterModel.position.y = characterModel.userData.originalY - (isSquatting ? 0.5 : 0);
     }
 
     let appliedCount = 0;
@@ -55,121 +68,245 @@ function applyBones(poseData) {
     });
     characterModel.updateMatrixWorld(true);
 
-    // 2. Xử lý theo thứ tự phân cấp (Cha -> Con)
-    BONE_ORDER.forEach(shortName => {
-        let boneName = "mixamorig1:" + shortName;
-        let data = poseData.bones[boneName];
-        if (!data || !data.target_vec) return;
+    // ── Xử lý CÚI NGƯỜI bằng world-space quaternion ────────────────────
+    if (isBowing) {
+        const totalLeanRad = THREE.MathUtils.degToRad(torsoLean);
+        const perBoneRad = totalLeanRad / 3;
 
-        let normalizedKey = normalizeBoneName(boneName);
-        let found = boneMap[normalizedKey];
-        if (!found) return;
+        // ── Xác định trục lean thực tế từ xương Hips ──────────────────
+        // Thay vì dùng world X (sai nếu nhân vật không face +Z/-Z),
+        // lấy trục ngang (lateral) từ quaternion của xương Hips.
+        // Hips local X-axis trong world space = trục trái-phải thực sự của nhân vật.
+        const hipsKey = normalizeBoneName('mixamorig1:Hips');
+        const hipsBone = boneMap[hipsKey];
+        let leanAxis = new THREE.Vector3(1, 0, 0); // fallback
+        if (hipsBone) {
+            characterModel.updateMatrixWorld(true);
+            const hipsWorldQuat = new THREE.Quaternion();
+            hipsBone.getWorldQuaternion(hipsWorldQuat);
+            // Local X của Hips = trục ngang của nhân vật trong world space
+            leanAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(hipsWorldQuat).normalize();
+        }
 
-        // ── HEAD & NECK: giữ T-Pose, tránh cúi đầu sai ──
-        if (shortName === 'Head' || shortName === 'Neck') {
-            if (restQuaternions[found.name]) {
-                found.quaternion.copy(restQuaternions[found.name]);
+        const SPINE_BONES = ['Spine', 'Spine1', 'Spine2'];
+        SPINE_BONES.forEach(function (shortName, idx) {
+            const boneName = 'mixamorig1:' + shortName;
+            const normalizedKey = normalizeBoneName(boneName);
+            const bone = boneMap[normalizedKey];
+            if (!bone) return;
+
+            characterModel.updateMatrixWorld(true);
+
+            // Tìm child bone
+            let childBone = null;
+            for (let i = 0; i < bone.children.length; i++) {
+                if (bone.children[i].type === 'Bone' || bone.children[i].isBone) {
+                    childBone = bone.children[i]; break;
+                }
             }
+            if (!childBone) { appliedCount++; return; }
+
+            // Vector hướng hiện tại (world space)
+            let posParent = new THREE.Vector3();
+            let posChild = new THREE.Vector3();
+            bone.getWorldPosition(posParent);
+            childBone.getWorldPosition(posChild);
+            let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
+
+            // Xoay quanh trục ngang thực của nhân vật
+            // Thử chiều dương trước; nếu Y của spine tăng (sai), đổi sang âm
+            let q_lean = new THREE.Quaternion().setFromAxisAngle(leanAxis, perBoneRad);
+            let v_test = v_current.clone().applyQuaternion(q_lean);
+            if (v_test.y > v_current.y + 0.005) {
+                // Cúi sai chiều (Y tăng = ngẩng lên thay vì cúi) → đổi chiều
+                q_lean = new THREE.Quaternion().setFromAxisAngle(leanAxis, -perBoneRad);
+            }
+
+            // Áp dụng world rotation → chuyển về local space
+            let oldWorldQuat = new THREE.Quaternion();
+            bone.getWorldQuaternion(oldWorldQuat);
+            let newWorldQuat = q_lean.clone().multiply(oldWorldQuat);
+            let parentWorldQuat = new THREE.Quaternion();
+            if (bone.parent) bone.parent.getWorldQuaternion(parentWorldQuat);
+            let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+            let restQuat = restQuaternions[bone.name];
+            if (restQuat) bone.quaternion.slerpQuaternions(restQuat, localQuat, 0.95);
+            else bone.quaternion.copy(localQuat);
+            bone.updateMatrix();
             appliedCount++;
-            return;
-        }
+        });
 
-        // Tìm child bone đầu tiên để làm vector hướng
-        let childBone = null;
-        for (let i = 0; i < found.children.length; i++) {
-            if (found.children[i].type === 'Bone' || found.children[i].isBone) {
-                childBone = found.children[i];
-                break;
+        // Cổ: cúi nhẹ theo cùng trục
+        const neckKey = normalizeBoneName('mixamorig1:Neck');
+        const neckBone = boneMap[neckKey];
+        if (neckBone) {
+            characterModel.updateMatrixWorld(true);
+            const neckLeanRad = THREE.MathUtils.degToRad(Math.min(torsoLean * 0.25, 35));
+            let q_neck = new THREE.Quaternion().setFromAxisAngle(leanAxis, perBoneRad > 0 ? neckLeanRad : -neckLeanRad);
+            let posNeck = new THREE.Vector3(); neckBone.getWorldPosition(posNeck);
+            let neckV = new THREE.Vector3(0, 1, 0);
+            let neckTest = neckV.clone().applyQuaternion(q_neck);
+            if (neckTest.y > neckV.y + 0.005) {
+                q_neck = new THREE.Quaternion().setFromAxisAngle(leanAxis, -neckLeanRad);
             }
+            let oldNeckWorldQuat = new THREE.Quaternion();
+            neckBone.getWorldQuaternion(oldNeckWorldQuat);
+            let newNeckWorldQuat = q_neck.clone().multiply(oldNeckWorldQuat);
+            let neckParentWorldQuat = new THREE.Quaternion();
+            if (neckBone.parent) neckBone.parent.getWorldQuaternion(neckParentWorldQuat);
+            let neckLocalQuat = neckParentWorldQuat.clone().invert().multiply(newNeckWorldQuat);
+            let neckRestQuat = restQuaternions[neckBone.name];
+            if (neckRestQuat) neckBone.quaternion.slerpQuaternions(neckRestQuat, neckLocalQuat, 0.85);
+            else neckBone.quaternion.copy(neckLocalQuat);
+            neckBone.updateMatrix();
+            appliedCount++;
         }
 
-        if (!childBone) return;
-
-        // Cập nhật world matrix sau khi các parent đã xoay
+        // Xử lý tay và chân qua vector tracking như cũ
+        const LIMB_BONES = [
+            'LeftArm', 'LeftForeArm',
+            'RightArm', 'RightForeArm',
+            'LeftUpLeg', 'LeftLeg',
+            'RightUpLeg', 'RightLeg'
+        ];
         characterModel.updateMatrixWorld(true);
-
-        // Vector hướng hiện tại của xương (world space)
-        let posParent = new THREE.Vector3();
-        let posChild  = new THREE.Vector3();
-        found.getWorldPosition(posParent);
-        childBone.getWorldPosition(posChild);
-        let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
-
-        // Vector mục tiêu từ Python (world space, đã chuyển hệ tọa độ)
-        let v_target = new THREE.Vector3(
-            data.target_vec.x,
-            data.target_vec.y,
-            data.target_vec.z
-        ).normalize();
-
-        // Góc giữa vector hiện tại và mục tiêu (rad)
-        let dot = THREE.MathUtils.clamp(v_current.dot(v_target), -1, 1);
-        let angleDiff = Math.acos(dot);
-
-        // Nếu góc lệch quá nhỏ thì bỏ qua
-        if (angleDiff < 0.01) {
+        LIMB_BONES.forEach(function (shortName) {
+            const boneName = 'mixamorig1:' + shortName;
+            const data = bonesData[boneName];
+            if (!data || !data.target_vec) return;
+            const normalizedKey = normalizeBoneName(boneName);
+            const found = boneMap[normalizedKey];
+            if (!found) return;
+            let childBone = null;
+            for (let i = 0; i < found.children.length; i++) {
+                if (found.children[i].type === 'Bone' || found.children[i].isBone) {
+                    childBone = found.children[i]; break;
+                }
+            }
+            if (!childBone) return;
+            characterModel.updateMatrixWorld(true);
+            let posParent = new THREE.Vector3();
+            let posChild = new THREE.Vector3();
+            found.getWorldPosition(posParent);
+            childBone.getWorldPosition(posChild);
+            let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
+            let v_target = new THREE.Vector3(data.target_vec.x, data.target_vec.y, data.target_vec.z).normalize();
+            let dot = THREE.MathUtils.clamp(v_current.dot(v_target), -1, 1);
+            let angleDiff = Math.acos(dot);
+            if (angleDiff < 0.01) { appliedCount++; return; }
+            if (dot < -0.999) { appliedCount++; return; }  // skip anti-parallel
+            let q_world = new THREE.Quaternion().setFromUnitVectors(v_current, v_target);
+            let oldWorldQuat = new THREE.Quaternion();
+            found.getWorldQuaternion(oldWorldQuat);
+            let newWorldQuat = q_world.clone().multiply(oldWorldQuat);
+            let parentWorldQuat = new THREE.Quaternion();
+            if (found.parent) found.parent.getWorldQuaternion(parentWorldQuat);
+            let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+            let restQuat = restQuaternions[found.name];
+            if (restQuat) found.quaternion.slerpQuaternions(restQuat, localQuat, 0.90);
+            else found.quaternion.copy(localQuat);
             appliedCount++;
-            return;
-        }
+        });
 
-        // ── GIỚI HẠN GÓC XOAY tối đa theo từng loại xương ──
-        // Thay vì clamp Euler (sai do hệ tọa độ local), ta clamp chính góc lệch
-        const MAX_ANGLE = {
-            'LeftArm':      Math.PI * 0.90,  // 162°
-            'RightArm':     Math.PI * 0.90,
-            'LeftForeArm':  Math.PI * 0.80,  // 144°
-            'RightForeArm': Math.PI * 0.80,
-            'LeftShoulder': Math.PI * 0.25,  // 45°
-            'RightShoulder':Math.PI * 0.25,
-            'Spine':        Math.PI * 0.30,
-            'Spine1':       Math.PI * 0.25,
-            'Spine2':       Math.PI * 0.25,
-            'LeftUpLeg':    Math.PI * 0.90,
-            'RightUpLeg':   Math.PI * 0.90,
-            'LeftLeg':      Math.PI * 0.85,
-            'RightLeg':     Math.PI * 0.85,
-        };
+    } else {
+        // ── Chế độ bình thường: Vector Tracking ────────────────────────
+        BONE_ORDER.forEach(shortName => {
+            let boneName = "mixamorig1:" + shortName;
+            let data = bonesData[boneName];
+            if (!data || !data.target_vec) return;
 
-        let maxAngle = MAX_ANGLE[shortName] || Math.PI;
-        // Nếu vượt quá giới hạn, lerp vector về gần hơn
-        let effectiveVec = v_target;
-        if (angleDiff > maxAngle) {
-            let t = maxAngle / angleDiff;
-            effectiveVec = v_current.clone().lerp(v_target, t).normalize();
-        }
+            let normalizedKey = normalizeBoneName(boneName);
+            let found = boneMap[normalizedKey];
+            if (!found) return;
 
-        // Tính quaternion world để xoay v_current → effectiveVec
-        let q_world = new THREE.Quaternion().setFromUnitVectors(v_current, effectiveVec);
+            // Bỏ qua Hips (root bone)
+            if (shortName === 'Hips') { appliedCount++; return; }
+            // Giữ Head + Shoulder trong T-Pose
+            // Vai KHÔNG được xoay: nếu xoay Shoulder trước khi xoay Arm,
+            // world-position của Arm sẽ sai → tay bị lệch hoàn toàn
+            if (shortName === 'Head' || shortName === 'LeftShoulder' || shortName === 'RightShoulder') {
+                if (restQuaternions[found.name]) found.quaternion.copy(restQuaternions[found.name]);
+                appliedCount++; return;
+            }
 
-        // Lấy world quaternion hiện tại của xương (CLONE để tránh mutate)
-        let oldWorldQuat = new THREE.Quaternion();
-        found.getWorldQuaternion(oldWorldQuat);
+            let childBone = null;
+            for (let i = 0; i < found.children.length; i++) {
+                if (found.children[i].type === 'Bone' || found.children[i].isBone) {
+                    childBone = found.children[i]; break;
+                }
+            }
+            if (!childBone) return;
 
-        // Áp dụng rotation world lên
-        let newWorldQuat = q_world.clone().multiply(oldWorldQuat);
+            characterModel.updateMatrixWorld(true);
+            let posParent = new THREE.Vector3();
+            let posChild = new THREE.Vector3();
+            found.getWorldPosition(posParent);
+            childBone.getWorldPosition(posChild);
+            let v_current = new THREE.Vector3().subVectors(posChild, posParent).normalize();
+            let v_target = new THREE.Vector3(data.target_vec.x, data.target_vec.y, data.target_vec.z).normalize();
+            let dot = THREE.MathUtils.clamp(v_current.dot(v_target), -1, 1);
+            let angleDiff = Math.acos(dot);
+            if (angleDiff < 0.01) { appliedCount++; return; }
+            if (dot < -0.999) { appliedCount++; return; }  // skip anti-parallel
 
-        // Chuyển về local space: localQuat = parent_world^-1 * new_world
-        let parentWorldQuat = new THREE.Quaternion();
-        if (found.parent) {
-            found.parent.getWorldQuaternion(parentWorldQuat);
-        }
+            const MAX_ANGLE = {
+                'LeftArm': Math.PI * 0.95,
+                'RightArm': Math.PI * 0.95,
+                'LeftForeArm': Math.PI * 0.90,
+                'RightForeArm': Math.PI * 0.90,
+                'LeftShoulder': Math.PI * 0.55,
+                'RightShoulder': Math.PI * 0.55,
+                'Spine': Math.PI * 0.95,
+                'Spine1': Math.PI * 0.95,
+                'Spine2': Math.PI * 0.95,
+                'LeftUpLeg': Math.PI * 0.90,
+                'RightUpLeg': Math.PI * 0.90,
+                'LeftLeg': Math.PI * 0.85,
+                'RightLeg': Math.PI * 0.85,
+            };
+            let maxAngle = MAX_ANGLE[shortName] || Math.PI;
+            let effectiveVec = v_target;
+            if (angleDiff > maxAngle) {
+                let t = maxAngle / angleDiff;
+                effectiveVec = v_current.clone().lerp(v_target, t).normalize();
+            }
+            let q_world = new THREE.Quaternion().setFromUnitVectors(v_current, effectiveVec);
+            let oldWorldQuat = new THREE.Quaternion();
+            found.getWorldQuaternion(oldWorldQuat);
+            let newWorldQuat = q_world.clone().multiply(oldWorldQuat);
+            let parentWorldQuat = new THREE.Quaternion();
+            if (found.parent) found.parent.getWorldQuaternion(parentWorldQuat);
+            let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
+            let restQuat = restQuaternions[found.name];
+            // Tay: gán trực tiếp localQuat, không slerp từ T-pose
+            // Slerp từ T-pose sẽ kéo tay dang ngang → gán thẳng 100% target
+            const IS_ARM = ['LeftArm', 'RightArm', 'LeftForeArm', 'RightForeArm'].includes(shortName);
+            if (IS_ARM) {
+                found.quaternion.copy(localQuat);
+            } else if (restQuat) {
+                found.quaternion.slerpQuaternions(restQuat, localQuat, 0.90);
+            } else {
+                found.quaternion.copy(localQuat);
+            }
+            appliedCount++;
+        });
+    }
 
-        let localQuat = parentWorldQuat.clone().invert().multiply(newWorldQuat);
-
-        // Slerp nhẹ từ T-Pose đến pose mới để tránh jump đột ngột
-        // (giảm clipping ở các tư thế cực đoan)
-        let SLERP_FACTOR = 0.85; // 85% tiến tới pose mục tiêu
-        let restQuat = restQuaternions[found.name];
-        if (restQuat) {
-            found.quaternion.slerpQuaternions(restQuat, localQuat, SLERP_FACTOR);
+    // ── Tự động điều chỉnh camera góc nhìn theo tư thế ──
+    if (camera && controls) {
+        if (isBowing) {
+            // Nhân vật cúi về phía +Z → camera ở +Z để thấy mặt/đầu cúi
+            camera.position.set(0, 1.5, 4);
+            controls.target.set(0, 0.6, 0);
         } else {
-            found.quaternion.copy(localQuat);
+            // Model face +Z → camera ở +Z thấy MẶT TRƯỚC
+            camera.position.set(0, 1.5, 4);
+            controls.target.set(0, 0.9, 0);
         }
+        controls.update();
+    }
 
-        appliedCount++;
-    });
-
-    // 3. Cập nhật trạng thái hiển thị
+    // Cập nhật trạng thái hiển thị
     let statusEl = document.getElementById('three-status');
     if (statusEl) {
         if (appliedCount > 0) {
@@ -204,9 +341,9 @@ function initViewer(containerId, poseData) {
         scene = new THREE.Scene();
         scene.background = new THREE.Color(0xFFFBF2); // Pastel yellow base
 
-        // Camera
+        // Camera — nhìn mặt trước nhân vật (model face -Z nên camera ở -Z)
         camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 100);
-        camera.position.set(0, 1.2, 3.5);
+        camera.position.set(0, 1.5, -4);
 
         // Renderer
         renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -298,6 +435,7 @@ function initViewer(containerId, poseData) {
                 // Căn giữa model
                 let box = new THREE.Box3().setFromObject(characterModel);
                 let center = box.getCenter(new THREE.Vector3());
+                characterModel.userData.originalY = -box.min.y;
                 characterModel.position.set(-center.x, -box.min.y, -center.z);
 
                 scene.add(characterModel);

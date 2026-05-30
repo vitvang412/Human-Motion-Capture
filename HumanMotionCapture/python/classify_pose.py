@@ -64,11 +64,24 @@ def classify_pose(angles):
     ) / 4)
 
     # 4. NGỒI XỔM
-    # Điều kiện: knee 40-70
+    # Điều kiện: knee 30-70, hip 30-80, torso_lean 25-60 (trọng tâm chúi tới trước để giữ thăng bằng)
     scores["NGỒI XỔM"] = int((
-        get_match_score(l_k, 40, 70) +
-        get_match_score(r_k, 40, 70)
-    ) / 2)
+        get_match_score(l_k, 30, 70) +
+        get_match_score(r_k, 30, 70) +
+        get_match_score(l_h, 30, 80) +
+        get_match_score(r_h, 30, 80) +
+        get_match_score(tl, 25, 60)
+    ) / 5)
+
+    # 4.5. NGỒI BỆT (Ngồi sát đất, co gối)
+    # Điều kiện: knee 30-80, hip 30-80, torso_lean 0-25 (thân người thẳng hoặc hơi ngả ra sau)
+    scores["NGỒI BỆT"] = int((
+        get_match_score(l_k, 30, 80) +
+        get_match_score(r_k, 30, 80) +
+        get_match_score(l_h, 30, 80) +
+        get_match_score(r_h, 30, 80) +
+        get_match_score(tl, 0, 25)
+    ) / 5)
 
     # 5. CÚI NGƯỜI
     # Điều kiện: torso_lean > 45, left_knee > 140
